@@ -1,6 +1,7 @@
 // Bot de surveillance du trafic bus - réseau Marne et Brie (Île-de-France Mobilités)
-// Poste les infos trafic dans un webhook Discord, une info = un message,
-// avec les lignes concernées listées en bas de l'embed.
+// Poste un message de statut unique dans un webhook Discord, mis à jour en place à
+// chaque cycle : une entrée "Lignes concernées" + le détail par perturbation active,
+// puis en bas la liste des lignes qui circulent normalement.
 
 require('dotenv').config();
 const { WebhookClient, EmbedBuilder } = require('discord.js');
@@ -33,6 +34,9 @@ const webhook = new WebhookClient({ url: config.webhookUrl });
 
 const STATUS_EMOJIS = {
   Travaux: '🚧',
+  Accident: '🚨',
+  'Grève': '✊',
+  Manifestation: '📢',
   'Déviation': '↪️',
   Retards: '⏱️',
   'Retards importants': '⏰',
@@ -40,6 +44,27 @@ const STATUS_EMOJIS = {
   Perturbation: '⚠️',
   'Service interrompu': '🚫',
   'Arrêt déplacé': '🚏'
+};
+
+// Limites Discord: 6000 caractères au total pour TOUS les embeds combinés du message,
+// 10 embeds max par message, 4096 caractères max par description d'embed.
+// Les titres markdown (###) ne fonctionnent que dans la description d'un embed, pas dans un champ :
+// chaque info trafic devient donc son propre embed (sa description porte le titre en ###).
+const DISCORD_MESSAGE_CHAR_LIMIT = 6000;
+const CHAR_SAFETY_MARGIN = 50;
+const MAX_EMBED_DESCRIPTION = 4096;
+const MAX_EMBEDS_PER_MESSAGE = 10;
+
+const HTML_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  eacute: 'é', egrave: 'è', ecirc: 'ê', euml: 'ë',
+  agrave: 'à', acirc: 'â', auml: 'ä',
+  icirc: 'î', iuml: 'ï',
+  ocirc: 'ô', ouml: 'ö',
+  ucirc: 'û', ugrave: 'ù', uuml: 'ü',
+  ccedil: 'ç', oelig: 'œ', aelig: 'æ',
+  rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”',
+  laquo: '«', raquo: '»', hellip: '…'
 };
 
 function safeParseJson(value, fallback) {
@@ -57,19 +82,48 @@ function lineEmojiTag(lineNumber) {
   return config.emojiMap[lineNumber] || `:Bus${lineNumber}:`;
 }
 
-// Ajoute le tag d'emoji devant chaque mention "Bus NNN" (numéro à 3 chiffres) trouvée dans un texte
-function annotateBusMentions(text) {
+// Remplace chaque numéro à 3 chiffres mentionné dans le texte par le tag de la ligne, seulement s'il
+// correspond à une vraie ligne du réseau surveillé — sinon on laisse le nombre tel quel (évite de
+// remplacer un horaire ou une adresse par coïncidence).
+function annotateLineMentions(text, validLineNumbers) {
   if (!text) return text;
-  return text.replace(/\bbus\s*(\d{3})\b/gi, (match, num) => `${lineEmojiTag(num)} ${match}`);
+  return text.replace(/\b(\d{3})\b/g, (match, num) => (
+    validLineNumbers.has(num) ? lineEmojiTag(num) : match
+  ));
 }
 
-function cleanHtml(message) {
-  if (!message) return '';
-  return message
-    .replace(/<\/?p>/g, '')
-    .replace(/<br\s*\/?>/g, '\n')
-    .replace(/<a\s+href=['"]([^'"]+)['"][^>]*>([^<]+)<\/a>/g, '$2')
-    .replace(/<\/?[^>]+(>|$)/g, '');
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&([a-z]+);/gi, (match, name) => HTML_ENTITIES[name.toLowerCase()] || match);
+}
+
+// Convertit le HTML renvoyé par l'API PRIM en markdown Discord (liens, gras, listes) plutôt
+// que de tout aplatir en texte brut.
+function htmlToDiscordMarkdown(html) {
+  if (!html) return '';
+  // Discord n'affiche pas le gras/italique si un espace (y compris une espace fine insécable comme
+  // U+202F, fréquente en typographie française avant/après « ») se trouve juste à l'intérieur des
+  // marqueurs ** ou * : on déplace donc les espaces en dehors des marqueurs plutôt qu'à l'intérieur.
+  const wrapTrimmed = marker => (match, tag, inner) => {
+    const leading = inner.match(/^\s*/)[0];
+    const trailing = inner.match(/\s*$/)[0];
+    const core = inner.slice(leading.length, inner.length - trailing.length);
+    return core ? `${leading}${marker}${core}${marker}${trailing}` : match;
+  };
+
+  return decodeHtmlEntities(html)
+    .replace(/<a\s+[^>]*href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+    .replace(/<(strong|b)>([\s\S]*?)<\/\1>/gi, wrapTrimmed('**'))
+    .replace(/<(em|i)>([\s\S]*?)<\/\1>/gi, wrapTrimmed('*'))
+    .replace(/<li>([\s\S]*?)<\/li>/gi, '- $1\n')
+    .replace(/<\/(ul|ol)>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/?[^>]+(>|$)/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function safeColor(hex) {
@@ -90,46 +144,71 @@ function formatDate(date) {
   });
 }
 
+// L'API PRIM ne renseigne pas toujours disruption.title : le vrai titre est dans
+// disruption.messages[], sur le canal "title". On centralise l'extraction ici.
+function getDisruptionTitle(disruption) {
+  if (typeof disruption.title === 'string' && disruption.title) return disruption.title;
+  if (Array.isArray(disruption.messages)) {
+    const titleMessage = disruption.messages.find(m => m.channel && m.channel.types && m.channel.types.includes('title'));
+    if (titleMessage && titleMessage.text) return titleMessage.text;
+  }
+  return disruption.cause || '';
+}
+
 function isElevatorFailure(disruption) {
   const elevatorKeywords = ['ascenseur', 'ascenseurs', 'escalier', 'escaliers', 'escalator', 'escalators'];
-  const haystacks = [disruption.title, disruption.cause, ...(disruption.messages || []).map(m => m.text)];
+  const haystacks = [getDisruptionTitle(disruption), ...(disruption.messages || []).map(m => m.text)];
   return haystacks.some(text => typeof text === 'string' && elevatorKeywords.some(k => text.toLowerCase().includes(k)));
 }
 
-function checkDisruptionBelongsToLine(disruption, line) {
-  if (disruption.title) {
-    const lowerTitle = disruption.title.toLowerCase();
-    const busMatch = lowerTitle.match(/bus\s*(\d{3})/i);
-    if (busMatch && busMatch[1] !== line.name) {
-      return false;
-    }
-    if (lowerTitle.includes(`bus ${line.name}`) || lowerTitle.includes(`bus${line.name}`)) {
-      return true;
-    }
-  }
+// Format Navitia : YYYYMMDDThhmmss
+function parseNavitiaDateTime(dateTime) {
+  if (!dateTime || dateTime.length < 15) return null;
+  const year = dateTime.slice(0, 4);
+  const month = dateTime.slice(4, 6);
+  const day = dateTime.slice(6, 8);
+  const hour = dateTime.slice(9, 11);
+  const minute = dateTime.slice(11, 13);
+  const second = dateTime.slice(13, 15);
+  return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+}
 
-  if (disruption.impacted_objects) {
-    for (const obj of disruption.impacted_objects) {
-      if (obj.pt_object &&
-          obj.pt_object.embedded_type === 'line' &&
-          obj.pt_object.line &&
-          obj.pt_object.line.id === `line:IDFM:${line.id}`) {
-        return true;
-      }
-    }
-  }
+// Le statut "active" de PRIM signifie juste que l'annonce est publiée, pas qu'elle est en cours :
+// une perturbation planifiée pour la semaine prochaine peut déjà être "active". On vérifie donc en
+// plus que le moment présent tombe bien dans une des périodes d'application de la perturbation.
+function isCurrentlyActive(disruption) {
+  const periods = disruption.application_periods;
+  if (!Array.isArray(periods) || periods.length === 0) return true;
 
-  return false;
+  const now = new Date();
+  return periods.some(period => {
+    const begin = parseNavitiaDateTime(period.begin);
+    const end = parseNavitiaDateTime(period.end);
+    if (begin && now < begin) return false;
+    if (end && now > end) return false;
+    return true;
+  });
 }
 
 function getStatusFromDisruption(disruption) {
-  if (!disruption.severity || !disruption.severity.effect) {
-    const cause = (disruption.cause || '').toLowerCase();
-    if (cause.includes('travaux')) return 'Travaux';
-    if (cause.includes('retard') || cause.includes('ralenti')) return 'Retards';
-    if (cause.includes('interrompu')) return 'Service interrompu';
-    return 'Information';
-  }
+  const cause = (disruption.cause || '').toLowerCase();
+  const severityName = disruption.severity && disruption.severity.name ? disruption.severity.name.toLowerCase() : '';
+  // La cause structurée de PRIM est parfois un libellé générique ("perturbation") même quand le texte
+  // détaillé parle explicitement de travaux : on scanne aussi le texte complet en secours.
+  const fullText = [getDisruptionTitle(disruption), ...(disruption.messages || []).map(m => m.text)]
+    .filter(t => typeof t === 'string').join(' ').toLowerCase();
+
+  // PRIM classe presque tous les vrais incidents sous le même effet générique (ex: SIGNIFICANT_DELAYS
+  // pour de simples travaux) : la cause réelle, quand elle est fournie, est plus fiable que cet effet.
+  if (severityName.includes('information') || cause.includes('information')) return 'Information';
+  if (cause.includes('travaux') || fullText.includes('travaux')) return 'Travaux';
+  if (cause.includes('accident') || fullText.includes('accident')) return 'Accident';
+  if (cause.includes('grève') || cause.includes('greve') || fullText.includes('grève') || fullText.includes('greve')) return 'Grève';
+  if (cause.includes('manifestation') || fullText.includes('manifestation')) return 'Manifestation';
+  if (cause.includes('retard') || cause.includes('ralenti')) return 'Retards';
+  if (cause.includes('interrompu')) return 'Service interrompu';
+
+  if (!disruption.severity || !disruption.severity.effect) return 'Information';
 
   switch (disruption.severity.effect) {
     case 'ADDITIONAL_SERVICE': return 'Service supplémentaire';
@@ -190,12 +269,18 @@ async function getNetworkLines() {
   return lines;
 }
 
-// Récupère les perturbations actives (hors pannes d'ascenseur) pour une ligne donnée
-async function fetchLineDisruptions(line) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Récupère les perturbations actives (hors pannes d'ascenseur) pour une ligne donnée.
+// Réessaie avec un backoff si l'API PRIM répond 429 (limite de débit dépassée).
+async function fetchLineDisruptions(line, attempt = 1) {
   const endpoint = `${config.apiBaseUrl}/lines/line:IDFM:${line.id}/line_reports`;
 
+  let response;
   try {
-    const response = await axios.get(endpoint, {
+    response = await axios.get(endpoint, {
       headers: {
         apikey: config.apiKey,
         Accept: 'application/json'
@@ -207,77 +292,81 @@ async function fetchLineDisruptions(line) {
         depth: 3
       }
     });
-
-    const allDisruptions = [];
-
-    if (Array.isArray(response.data.disruptions)) {
-      const direct = response.data.disruptions.filter(d =>
-        d.impacted_objects && d.impacted_objects.some(obj =>
-          obj.pt_object &&
-          obj.pt_object.embedded_type === 'line' &&
-          obj.pt_object.line &&
-          obj.pt_object.line.id === `line:IDFM:${line.id}`
-        )
-      );
-      allDisruptions.push(...direct);
+  } catch (error) {
+    if (error.response && error.response.status === 429 && attempt <= 3) {
+      const retryAfter = parseFloat(error.response.headers['retry-after']);
+      const delay = Number.isFinite(retryAfter) ? retryAfter * 1000 : attempt * 1500;
+      console.log(`Limite de débit atteinte pour ${line.displayName}, nouvelle tentative dans ${Math.round(delay)}ms...`);
+      await sleep(delay);
+      return fetchLineDisruptions(line, attempt + 1);
     }
+    console.error(`Erreur API pour ${line.displayName}:`, error.response ? `${error.response.status} ${JSON.stringify(error.response.data)}` : error.message);
+    return null;
+  }
 
-    if (Array.isArray(response.data.line_reports)) {
-      for (const report of response.data.line_reports) {
-        if (!Array.isArray(report.pt_objects)) continue;
+  const allDisruptions = [];
 
-        const disruptionIds = new Set();
-        if (report.line && report.line.links) {
-          for (const link of report.line.links) {
+  if (Array.isArray(response.data.disruptions)) {
+    const direct = response.data.disruptions.filter(d =>
+      d.impacted_objects && d.impacted_objects.some(obj =>
+        obj.pt_object &&
+        obj.pt_object.embedded_type === 'line' &&
+        obj.pt_object.line &&
+        obj.pt_object.line.id === `line:IDFM:${line.id}`
+      )
+    );
+    allDisruptions.push(...direct);
+  }
+
+  if (Array.isArray(response.data.line_reports)) {
+    for (const report of response.data.line_reports) {
+      if (!Array.isArray(report.pt_objects)) continue;
+
+      const disruptionIds = new Set();
+      if (report.line && report.line.links) {
+        for (const link of report.line.links) {
+          if (link.type === 'disruption') disruptionIds.add(link.id);
+        }
+      }
+      for (const obj of report.pt_objects) {
+        if (obj.embedded_type === 'disruption' && obj.disruption) {
+          disruptionIds.add(obj.disruption.id);
+          allDisruptions.push(obj.disruption);
+        } else if (obj[obj.embedded_type] && obj[obj.embedded_type].links) {
+          for (const link of obj[obj.embedded_type].links) {
             if (link.type === 'disruption') disruptionIds.add(link.id);
           }
         }
-        for (const obj of report.pt_objects) {
-          if (obj.embedded_type === 'disruption' && obj.disruption) {
-            disruptionIds.add(obj.disruption.id);
-            allDisruptions.push(obj.disruption);
-          } else if (obj[obj.embedded_type] && obj[obj.embedded_type].links) {
-            for (const link of obj[obj.embedded_type].links) {
-              if (link.type === 'disruption') disruptionIds.add(link.id);
-            }
-          }
-        }
+      }
 
-        if (disruptionIds.size > 0 && response.data.disruptions) {
-          for (const disruption of response.data.disruptions) {
-            if (disruptionIds.has(disruption.id) && !allDisruptions.some(d => d.id === disruption.id)) {
-              allDisruptions.push(disruption);
-            }
+      if (disruptionIds.size > 0 && response.data.disruptions) {
+        for (const disruption of response.data.disruptions) {
+          if (disruptionIds.has(disruption.id) && !allDisruptions.some(d => d.id === disruption.id)) {
+            allDisruptions.push(disruption);
           }
         }
       }
     }
-
-    return allDisruptions.filter(d =>
-      d.status === 'active' &&
-      !isElevatorFailure(d) &&
-      checkDisruptionBelongsToLine(d, line)
-    );
-  } catch (error) {
-    console.error(`Erreur API pour ${line.displayName}:`, error.response ? `${error.response.status} ${JSON.stringify(error.response.data)}` : error.message);
-    return [];
   }
+
+  return allDisruptions.filter(d =>
+    d.status === 'active' &&
+    isCurrentlyActive(d) &&
+    !isElevatorFailure(d)
+  );
 }
 
 function extractDisruptionInfo(disruption) {
   let message = '';
-  let title = '';
 
   if (disruption.messages && disruption.messages.length > 0) {
     const webMessage = disruption.messages.find(m => m.channel && m.channel.types && m.channel.types.includes('web'));
-    const titleMessage = disruption.messages.find(m => m.channel && m.channel.types && m.channel.types.includes('title'));
     if (webMessage) message = webMessage.text || '';
-    if (titleMessage) title = titleMessage.text || '';
   }
 
   return {
     id: disruption.id,
-    title: title || disruption.cause || 'Perturbation',
+    title: getDisruptionTitle(disruption) || 'Perturbation',
     message,
     status: getStatusFromDisruption(disruption),
     color: disruption.severity ? disruption.severity.color : null,
@@ -285,8 +374,105 @@ function extractDisruptionInfo(disruption) {
   };
 }
 
-function computeHash(info, lines) {
-  const raw = `${info.title}|${info.message}|${info.status}|${[...lines].sort().join(',')}`;
+// L'API PRIM répète souvent le titre en tête du message détaillé, parfois avec des balises <strong>
+// coupées en plein milieu (ex: "**...du ****lundi 13**"). On compare donc les deux textes sans
+// aucun caractère markdown, puis on retrouve la position d'origine correspondante pour couper proprement.
+function stripDuplicateTitle(title, body) {
+  if (!title || !body) return body;
+  const plainTitle = title.replace(/[*_]/g, '').trim().toLowerCase();
+  if (!plainTitle) return body;
+
+  const window = body.slice(0, plainTitle.length + 150);
+  let stripped = '';
+  const indexMap = [];
+  for (let i = 0; i < window.length; i++) {
+    const ch = window[i];
+    if (ch === '*' || ch === '_') continue;
+    stripped += ch.toLowerCase();
+    indexMap.push(i);
+  }
+
+  const idx = stripped.indexOf(plainTitle);
+  if (idx === -1) return body;
+
+  const endStrippedIdx = idx + plainTitle.length;
+  const endOriginalIdx = endStrippedIdx < indexMap.length ? indexMap[endStrippedIdx] : window.length;
+
+  return body.slice(endOriginalIdx).replace(/^[\s*_]+/, '').trim();
+}
+
+// Construit les données (texte + couleur) d'une perturbation. Chaque perturbation devient son PROPRE
+// embed (pas un champ partagé) : c'est le seul moyen d'avoir un vrai titre markdown ### en plus gros,
+// qui ne fonctionne que dans la description d'un embed, pas dans un champ.
+function buildDisruptionEmbedData(info, concernedLines, validLineNumbers) {
+  const statusEmoji = STATUS_EMOJIS[info.status] || 'ℹ️';
+  const dedupedBody = stripDuplicateTitle(info.title, htmlToDiscordMarkdown(info.message));
+  const title = annotateLineMentions(info.title, validLineNumbers);
+  const body = annotateLineMentions(dedupedBody, validLineNumbers) || 'Aucun détail supplémentaire.';
+  const tags = [...concernedLines].sort().map(t => (/^\d{3}$/.test(t) ? lineEmojiTag(t) : `**${t}**`));
+
+  let description = `### ${statusEmoji} ${title}\n${body}\n\n### Lignes concernées\n### ${tags.join(' ')}`;
+  if (description.length > MAX_EMBED_DESCRIPTION) {
+    description = `${description.slice(0, MAX_EMBED_DESCRIPTION - 1)}…`;
+  }
+
+  return { description, color: safeColor(info.color) };
+}
+
+// Répartit un embed par perturbation (+ un embed de bilan final) sur autant de MESSAGES Discord que
+// nécessaire pour TOUT afficher, sans jamais rien tronquer : 10 embeds et 6000 caractères combinés
+// sont des limites par message, donc on ouvre un nouveau message dès qu'un plafond serait dépassé.
+function buildStatusMessages(disruptionEmbedsData, hasIncident) {
+  const titleText = `📡 Infos trafic — Réseau ${config.networkName}`;
+  const footerText = `Dernière mise à jour : ${formatDate(new Date())}`;
+  const summaryText = hasIncident
+    ? `### ✅ Les autres lignes de bus ${config.networkName} circulent normalement.`
+    : `### ✅ Toutes les lignes de bus ${config.networkName} circulent normalement.`;
+  const summaryColor = '#2ECC71';
+
+  const allEntries = [...disruptionEmbedsData, { description: summaryText, color: summaryColor }];
+
+  const messages = [];
+  let currentMessageEmbeds = [];
+  let currentMessageChars = 0;
+
+  const closeMessage = () => {
+    messages.push(currentMessageEmbeds);
+    currentMessageEmbeds = [];
+    currentMessageChars = 0;
+  };
+
+  for (const entry of allEntries) {
+    const overhead = (messages.length === 0 && currentMessageEmbeds.length === 0) ? titleText.length : 0;
+    const overCharBudget = currentMessageChars + entry.description.length + overhead + CHAR_SAFETY_MARGIN > DISCORD_MESSAGE_CHAR_LIMIT;
+    const overEmbedCount = currentMessageEmbeds.length >= MAX_EMBEDS_PER_MESSAGE;
+
+    if (overCharBudget || overEmbedCount) {
+      closeMessage();
+    }
+
+    currentMessageEmbeds.push(new EmbedBuilder().setColor(entry.color).setDescription(entry.description));
+    currentMessageChars += entry.description.length;
+  }
+  closeMessage();
+
+  messages[0][0].setTitle(titleText);
+  const lastMessageEmbeds = messages[messages.length - 1];
+  lastMessageEmbeds[lastMessageEmbeds.length - 1].setFooter({ text: footerText });
+
+  return messages;
+}
+
+// Calculé sur le JSON des embeds réellement construits (pas sur des données intermédiaires) pour être
+// sûr de détecter tout changement visible, y compris ceux dus à une mise à jour du code de mise en forme.
+// Le footer (horodatage "Dernière mise à jour") est exclu : il change à chaque cycle et ferait croire
+// à un changement en permanence.
+function computeHash(messages) {
+  const raw = JSON.stringify(messages.map(embeds => embeds.map(e => {
+    const json = e.toJSON();
+    delete json.footer;
+    return json;
+  })));
   return crypto.createHash('sha1').update(raw).digest('hex');
 }
 
@@ -298,7 +484,7 @@ function loadState() {
   } catch (error) {
     console.error('Erreur lors de la lecture du fichier d\'état:', error.message);
   }
-  return { disruptions: {} };
+  return { messageIds: [], hash: null };
 }
 
 function saveState(state) {
@@ -309,25 +495,6 @@ function saveState(state) {
   } catch (error) {
     console.error('Erreur lors de l\'écriture du fichier d\'état:', error.message);
   }
-}
-
-function buildDisruptionEmbed(info, lines) {
-  const statusEmoji = STATUS_EMOJIS[info.status] || 'ℹ️';
-  const title = annotateBusMentions(info.title).slice(0, 256);
-  const description = (annotateBusMentions(cleanHtml(info.message)) || 'Aucun détail supplémentaire.').slice(0, 4096);
-
-  const embed = new EmbedBuilder()
-    .setColor(safeColor(info.color))
-    .setTitle(`${statusEmoji} ${title}`)
-    .setDescription(description)
-    .setFooter({ text: `Dernière mise à jour : ${formatDate(new Date(info.lastUpdate))}` });
-
-  if (lines.size > 0) {
-    const tags = [...lines].sort().map(name => (/^\d{3}$/.test(name) ? lineEmojiTag(name) : `**${name}**`));
-    embed.addFields({ name: 'Lignes concernées', value: tags.join(' ').slice(0, 1024) });
-  }
-
-  return embed;
 }
 
 async function monitorTraffic() {
@@ -344,64 +511,89 @@ async function monitorTraffic() {
   // Regroupe les perturbations par ID pour fusionner les lignes concernées quand une même perturbation touche plusieurs lignes
   const disruptionsById = {};
 
+  // Petite pause entre chaque ligne pour rester sous la limite de débit de l'API PRIM
   for (const line of lines) {
     const disruptions = await fetchLineDisruptions(line);
-    for (const disruption of disruptions) {
-      if (!disruptionsById[disruption.id]) {
-        disruptionsById[disruption.id] = {
-          info: extractDisruptionInfo(disruption),
-          lines: new Set()
-        };
-      }
-      disruptionsById[disruption.id].lines.add(line.name);
-    }
-  }
-
-  const state = loadState();
-  let stateChanged = false;
-
-  for (const [id, { info, lines: concernedLines }] of Object.entries(disruptionsById)) {
-    const hash = computeHash(info, concernedLines);
-    const existing = state.disruptions[id];
-    const embed = buildDisruptionEmbed(info, concernedLines);
-
-    if (!existing) {
-      try {
-        const sent = await webhook.send({ embeds: [embed] });
-        state.disruptions[id] = { hash, messageId: sent.id, lines: [...concernedLines] };
-        stateChanged = true;
-        console.log(`Nouvelle info trafic postée: ${info.title}`);
-      } catch (error) {
-        console.error('Erreur lors de l\'envoi au webhook:', error.message);
-      }
-    } else if (existing.hash !== hash) {
-      try {
-        await webhook.editMessage(existing.messageId, { embeds: [embed] });
-        console.log(`Info trafic mise à jour: ${info.title}`);
-      } catch (error) {
-        console.error('Erreur lors de la mise à jour, envoi d\'un nouveau message:', error.message);
-        try {
-          const sent = await webhook.send({ embeds: [embed] });
-          existing.messageId = sent.id;
-        } catch (sendError) {
-          console.error('Erreur lors de l\'envoi du message de remplacement:', sendError.message);
+    if (disruptions) {
+      for (const disruption of disruptions) {
+        if (!disruptionsById[disruption.id]) {
+          disruptionsById[disruption.id] = {
+            info: extractDisruptionInfo(disruption),
+            lines: new Set()
+          };
         }
+        disruptionsById[disruption.id].lines.add(line.name);
       }
-      existing.hash = hash;
-      existing.lines = [...concernedLines];
-      stateChanged = true;
     }
+    await sleep(300);
   }
 
-  // Nettoyer les perturbations qui ne sont plus actives (le message Discord déjà envoyé reste en place)
-  for (const id of Object.keys(state.disruptions)) {
-    if (!disruptionsById[id]) {
-      delete state.disruptions[id];
-      stateChanged = true;
-    }
+  // Trie par numéro de ligne le plus bas concerné, comme sur le site IDFM (les lignes sans numéro
+  // comme TàD passent en dernier)
+  const minLineNumber = concernedLines => Math.min(
+    ...[...concernedLines].map(name => (/^\d+$/.test(name) ? parseInt(name, 10) : Infinity))
+  );
+  const sortedDisruptions = Object.values(disruptionsById).sort((a, b) =>
+    minLineNumber(a.lines) - minLineNumber(b.lines)
+  );
+
+  const validLineNumbers = new Set(lines.map(l => l.name).filter(name => /^\d{3}$/.test(name)));
+  const disruptionEmbedsData = sortedDisruptions.map(({ info, lines: concernedLines }) =>
+    buildDisruptionEmbedData(info, concernedLines, validLineNumbers)
+  );
+  const hasIncident = disruptionEmbedsData.length > 0;
+  const messages = buildStatusMessages(disruptionEmbedsData, hasIncident);
+
+  const hash = computeHash(messages);
+  const state = loadState();
+
+  if (state.hash === hash) {
+    console.log('Aucun changement depuis la dernière vérification.');
+    return;
   }
 
-  if (stateChanged) saveState(state);
+  try {
+    const messageIds = [];
+    for (let i = 0; i < messages.length; i++) {
+      const embeds = messages[i];
+      const existingId = state.messageIds[i];
+      if (existingId) {
+        await webhook.editMessage(existingId, { embeds });
+        messageIds.push(existingId);
+      } else {
+        const sent = await webhook.send({ embeds });
+        messageIds.push(sent.id);
+      }
+    }
+
+    // Supprime les messages devenus superflus si le nombre de perturbations a diminué
+    for (let i = messages.length; i < state.messageIds.length; i++) {
+      try {
+        await webhook.deleteMessage(state.messageIds[i]);
+      } catch (deleteError) {
+        console.error('Erreur lors de la suppression d\'un ancien message:', deleteError.message);
+      }
+    }
+
+    state.messageIds = messageIds;
+    state.hash = hash;
+    saveState(state);
+    console.log(`Statut mis à jour (${messages.length} message(s) Discord).`);
+  } catch (error) {
+    console.error('Erreur lors de la mise à jour des messages, tentative d\'envoi de nouveaux messages:', error.message);
+    try {
+      const messageIds = [];
+      for (const embeds of messages) {
+        const sent = await webhook.send({ embeds });
+        messageIds.push(sent.id);
+      }
+      state.messageIds = messageIds;
+      state.hash = hash;
+      saveState(state);
+    } catch (sendError) {
+      console.error('Erreur lors de l\'envoi des messages de remplacement:', sendError.message);
+    }
+  }
 
   console.log('Cycle de surveillance du trafic terminé.');
 }
