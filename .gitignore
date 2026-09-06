@@ -1,0 +1,5 @@
+node_modules/
+.env
+data/
+api_responses/
+.DS_Store
