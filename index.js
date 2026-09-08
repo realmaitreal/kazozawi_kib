@@ -54,6 +54,9 @@ const DISCORD_MESSAGE_CHAR_LIMIT = 6000;
 const CHAR_SAFETY_MARGIN = 50;
 const MAX_EMBED_DESCRIPTION = 4096;
 const MAX_EMBEDS_PER_MESSAGE = 10;
+// Délai avant de retenter les emojis personnalisés refusés par Discord (au cas où le serveur aurait
+// débloqué plus de slots entretemps)
+const BROKEN_EMOJI_RETRY_MS = 24 * 60 * 60 * 1000;
 
 const HTML_ENTITIES = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
@@ -77,18 +80,20 @@ function safeParseJson(value, fallback) {
   }
 }
 
-// Formate le tag d'une ligne au format demandé (:BusXXX:), ou l'emoji personnalisé si configuré
-function lineEmojiTag(lineNumber) {
+// Formate le tag d'une ligne : emoji personnalisé si configuré et fonctionnel, chiffre brut si Discord
+// a déjà refusé cet emoji (serveur au-delà de sa capacité de slots), ":BusXXX:" sinon
+function lineEmojiTag(lineNumber, brokenEmojiLines) {
+  if (brokenEmojiLines && brokenEmojiLines.has(lineNumber)) return lineNumber;
   return config.emojiMap[lineNumber] || `:Bus${lineNumber}:`;
 }
 
 // Remplace chaque numéro à 3 chiffres mentionné dans le texte par le tag de la ligne, seulement s'il
 // correspond à une vraie ligne du réseau surveillé — sinon on laisse le nombre tel quel (évite de
 // remplacer un horaire ou une adresse par coïncidence).
-function annotateLineMentions(text, validLineNumbers) {
+function annotateLineMentions(text, validLineNumbers, brokenEmojiLines) {
   if (!text) return text;
   return text.replace(/\b(\d{3})\b/g, (match, num) => (
-    validLineNumbers.has(num) ? lineEmojiTag(num) : match
+    validLineNumbers.has(num) ? lineEmojiTag(num, brokenEmojiLines) : match
   ));
 }
 
@@ -404,12 +409,12 @@ function stripDuplicateTitle(title, body) {
 // Construit les données (texte + couleur) d'une perturbation. Chaque perturbation devient son PROPRE
 // embed (pas un champ partagé) : c'est le seul moyen d'avoir un vrai titre markdown ### en plus gros,
 // qui ne fonctionne que dans la description d'un embed, pas dans un champ.
-function buildDisruptionEmbedData(info, concernedLines, validLineNumbers) {
+function buildDisruptionEmbedData(info, concernedLines, validLineNumbers, brokenEmojiLines) {
   const statusEmoji = STATUS_EMOJIS[info.status] || 'ℹ️';
   const dedupedBody = stripDuplicateTitle(info.title, htmlToDiscordMarkdown(info.message));
-  const title = annotateLineMentions(info.title, validLineNumbers);
-  const body = annotateLineMentions(dedupedBody, validLineNumbers) || 'Aucun détail supplémentaire.';
-  const tags = [...concernedLines].sort().map(t => (/^\d{3}$/.test(t) ? lineEmojiTag(t) : `**${t}**`));
+  const title = annotateLineMentions(info.title, validLineNumbers, brokenEmojiLines);
+  const body = annotateLineMentions(dedupedBody, validLineNumbers, brokenEmojiLines) || 'Aucun détail supplémentaire.';
+  const tags = [...concernedLines].sort().map(t => (/^\d{3}$/.test(t) ? lineEmojiTag(t, brokenEmojiLines) : `**${t}**`));
 
   let description = `### ${statusEmoji} ${title}\n${body}\n\n### Lignes concernées\n### ${tags.join(' ')}`;
   if (description.length > MAX_EMBED_DESCRIPTION) {
@@ -484,7 +489,7 @@ function loadState() {
   } catch (error) {
     console.error('Erreur lors de la lecture du fichier d\'état:', error.message);
   }
-  return { messageIds: [], hash: null };
+  return { messageIds: [], hash: null, brokenEmojiLines: [], brokenEmojiLinesCheckedAt: null };
 }
 
 function saveState(state) {
@@ -537,33 +542,42 @@ async function monitorTraffic() {
     minLineNumber(a.lines) - minLineNumber(b.lines)
   );
 
-  const validLineNumbers = new Set(lines.map(l => l.name).filter(name => /^\d{3}$/.test(name)));
-  const disruptionEmbedsData = sortedDisruptions.map(({ info, lines: concernedLines }) =>
-    buildDisruptionEmbedData(info, concernedLines, validLineNumbers)
-  );
-  const hasIncident = disruptionEmbedsData.length > 0;
-  const messages = buildStatusMessages(disruptionEmbedsData, hasIncident);
-
-  const hash = computeHash(messages);
   const state = loadState();
 
-  if (state.hash === hash) {
+  // Certains emojis personnalisés peuvent être refusés par Discord (serveur au-delà de sa capacité de
+  // slots) : on retente périodiquement au cas où des slots se libèrent, sinon on garde la liste connue.
+  const checkedAt = state.brokenEmojiLinesCheckedAt ? new Date(state.brokenEmojiLinesCheckedAt) : null;
+  const shouldRetryBroken = !checkedAt || (Date.now() - checkedAt.getTime()) > BROKEN_EMOJI_RETRY_MS;
+  let brokenEmojiLines = new Set(shouldRetryBroken ? [] : (state.brokenEmojiLines || []));
+
+  const validLineNumbers = new Set(lines.map(l => l.name).filter(name => /^\d{3}$/.test(name)));
+  const buildAll = () => {
+    const disruptionEmbedsData = sortedDisruptions.map(({ info, lines: concernedLines }) =>
+      buildDisruptionEmbedData(info, concernedLines, validLineNumbers, brokenEmojiLines)
+    );
+    const hasIncident = disruptionEmbedsData.length > 0;
+    return buildStatusMessages(disruptionEmbedsData, hasIncident);
+  };
+
+  let messages = buildAll();
+  let hash = computeHash(messages);
+
+  if (!shouldRetryBroken && state.hash === hash) {
     console.log('Aucun changement depuis la dernière vérification.');
     return;
   }
 
   try {
     const messageIds = [];
+    const returnedDescriptions = [];
     for (let i = 0; i < messages.length; i++) {
       const embeds = messages[i];
       const existingId = state.messageIds[i];
-      if (existingId) {
-        await webhook.editMessage(existingId, { embeds });
-        messageIds.push(existingId);
-      } else {
-        const sent = await webhook.send({ embeds });
-        messageIds.push(sent.id);
-      }
+      const result = existingId
+        ? await webhook.editMessage(existingId, { embeds })
+        : await webhook.send({ embeds });
+      messageIds.push(result.id);
+      for (const embed of result.embeds) returnedDescriptions.push(embed.description || '');
     }
 
     // Supprime les messages devenus superflus si le nombre de perturbations a diminué
@@ -575,8 +589,38 @@ async function monitorTraffic() {
       }
     }
 
+    // Vérifie si Discord a refusé un des emojis qu'on vient d'essayer (serveur au-delà de sa capacité
+    // de slots) ; si oui, corrige immédiatement en repassant ces lignes en chiffre brut plutôt que
+    // d'attendre le prochain cycle.
+    const fullText = returnedDescriptions.join('\n');
+    const attemptedNumbers = Object.keys(config.emojiMap).filter(n => !brokenEmojiLines.has(n));
+    const newlyBroken = new Set(attemptedNumbers.filter(num =>
+      fullText.includes(`:${num}:`) && !fullText.includes(config.emojiMap[num])
+    ));
+
+    if (newlyBroken.size > 0) {
+      for (const num of newlyBroken) brokenEmojiLines.add(num);
+      messages = buildAll();
+      hash = computeHash(messages);
+      for (let i = 0; i < messages.length; i++) {
+        await webhook.editMessage(messageIds[i], { embeds: messages[i] });
+      }
+      // Le passage en chiffre brut raccourcit le texte : il peut arriver qu'un message devienne inutile
+      for (let i = messages.length; i < messageIds.length; i++) {
+        try {
+          await webhook.deleteMessage(messageIds[i]);
+        } catch (deleteError) {
+          console.error('Erreur lors de la suppression d\'un message devenu superflu:', deleteError.message);
+        }
+      }
+      messageIds.length = messages.length;
+      console.log('Emojis refusés par Discord détectés et corrigés en chiffre brut:', [...newlyBroken].join(', '));
+    }
+
     state.messageIds = messageIds;
     state.hash = hash;
+    state.brokenEmojiLines = [...brokenEmojiLines];
+    if (shouldRetryBroken) state.brokenEmojiLinesCheckedAt = new Date().toISOString();
     saveState(state);
     console.log(`Statut mis à jour (${messages.length} message(s) Discord).`);
   } catch (error) {
@@ -589,6 +633,7 @@ async function monitorTraffic() {
       }
       state.messageIds = messageIds;
       state.hash = hash;
+      state.brokenEmojiLines = [...brokenEmojiLines];
       saveState(state);
     } catch (sendError) {
       console.error('Erreur lors de l\'envoi des messages de remplacement:', sendError.message);
